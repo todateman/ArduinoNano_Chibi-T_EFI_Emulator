@@ -5,8 +5,8 @@ const int swON = LOW;    // SWがONのピンの値はLOW
 const int swOFF = HIGH;  // SWがOFFのピンの値はHIGH
 
 // ピン定義
-const int KILL_IN_PIN = A4;    // キルスイッチ入力
-const int START_IN_PIN  = A5;  // スタータボタン入力
+const int KILL_IN_PIN = A4;    // キルスイッチ入力（内部プルアップ）
+const int START_IN_PIN  = A5;  // スタータボタン入力（内部プルアップ）
 const int POT_PIN = A7;        // 可変抵抗
 const int A_PHASE_PIN = 2;     // A相出力
 const int B_PHASE_PIN = 8;     // B相出力
@@ -15,26 +15,46 @@ const int G_PHASE_PIN = 5;     // G相出力
 const int KILL_OUT_PIN  = 7;   // キルスイッチ出力
 const int START_OUT_PIN = 6;   // スタータボタン出力
 
-
 // エンコーダ仕様（MA735互換）
 const int PULSES_PER_REV = 360;   // 1回転あたりのパルス数（PPT=359+1）
-const float MAX_RPM = 6500.0;     // 最大回転数
-const float START_RPM = 600.0;   // 始動時の回転数
+const int MAX_RPM = 6500;         // 最大回転数
+const int START_RPM = 600;        // 始動時の回転数
 
 // G相設定（変更可能）
 const int G_PHASE_ROTATIONS = 2;  // G相の出力周期（回転数）
-const float G_PHASE_START_DEG = 450.0;  // G相開始角度（度）
+const int G_PHASE_START_DEG = 450; // G相開始角度（度）
 const int G_PHASE_EDGES = 720;      // G相出力エッジ数(4エッジ/1度))
+
+// 高速計算用定数
+const int TOTAL_EDGES_PER_REV = PULSES_PER_REV * 4;  // 1回転あたりの総エッジ数
+const int TOTAL_EDGES_PER_CYCLE = TOTAL_EDGES_PER_REV * G_PHASE_ROTATIONS; // G相周期の総エッジ数
+const int G_PHASE_START_EDGES = (G_PHASE_START_DEG * TOTAL_EDGES_PER_REV) / 360; // G相開始エッジ
+const int G_PHASE_END_EDGES = G_PHASE_START_EDGES + G_PHASE_EDGES; // G相終了エッジ
+
+// 高速・高精度制御用タイマー変数
+volatile bool useHighPrecisionTimer = false;
+volatile unsigned long timerMicros = 0;
+volatile bool timerPulseFlag = false;
+
+// 高速ADC処理用変数
+volatile uint16_t adc0 = 0;              // ADC0読み取り値
+volatile bool adc0_read_complete = false; // ADC完了フラグ
+volatile uint8_t analog_port = 0;        // 現在のADCポート
+
+// ADC・RPM変換定数（Ardu-Stim方式）
+#define TMP_RPM_SHIFT 4    // x16倍のビットシフト
+#define TMP_RPM_CAP 9000   // 最大RPM制限
 
 // 変数
 unsigned long lastMicros = 0;   // 最後のパルス生成時間
 unsigned long pulseInterval;  // パルス間隔（マイクロ秒）
-float currentRPM = 0;           // 現在の回転数（RPM）
-int pulseCount = 0;             // パルスカウント
-bool aState = false;            // A相状態
-bool bState = false;            // B相状態
-bool zState = false;            // Z相状態
-bool gState = false;            // G相状態
+uint16_t currentRPM = 0;        // 現在の回転数（RPM）整数型
+uint16_t tmp_rpm = 0;          // 一時的RPM値（整数演算用）
+volatile int pulseCount = 0;             // パルスカウント
+volatile bool aState = false;            // A相状態
+volatile bool bState = false;            // B相状態
+volatile bool zState = false;            // Z相状態
+volatile bool gState = false;            // G相状態
 
 // デバッグ用
 unsigned long lastDebugTime = 0;    // 最後のデバッグ出力時間
@@ -42,6 +62,9 @@ const unsigned long DEBUG_INTERVAL = 1000; // 1秒間隔
 
 // プロトタイプ宣言
 void generatePulse();           // パルス生成関数
+void setupHighPrecisionTimer(); // 高精度タイマー設定
+void setTimerFrequency(uint32_t frequency); // タイマー周波数設定
+void setupHighSpeedADC();       // 高速ADC設定
 
 // パルス生成関数
 // この関数は、エンコーダのパルスを生成し、A相、B相、Z相、G相の状態を更新します。
@@ -50,20 +73,19 @@ void generatePulse() {
   // パルスカウントを増加
   pulseCount++;
   
-  // G相の周期を考慮したカウンターリセット
-  int totalEdgesPerCycle = PULSES_PER_REV * 4 * G_PHASE_ROTATIONS;
-  if (pulseCount >= totalEdgesPerCycle) {
+  // G相の周期を考慮したカウンターリセット（事前計算した定数使用）
+  if (pulseCount >= TOTAL_EDGES_PER_CYCLE) {
     pulseCount = 0;
   }
   
   // 現在の位置（1回転内）
-  int positionInRev = pulseCount % (PULSES_PER_REV * 4);
+  int positionInRev = pulseCount % TOTAL_EDGES_PER_REV;
   
   // A相とB相の状態を決定（90度位相差）
   bool newAState = (positionInRev % (PULSES_PER_REV * 2)) < PULSES_PER_REV;
   
   // B相の状態（A相より90度遅れ）
-  int bPosition = (positionInRev + PULSES_PER_REV) % (PULSES_PER_REV * 4);
+  int bPosition = (positionInRev + PULSES_PER_REV) % TOTAL_EDGES_PER_REV;
   bool newBState = (bPosition % (PULSES_PER_REV * 2)) < PULSES_PER_REV;
   
   // Z相（インデックス）の状態
@@ -75,21 +97,14 @@ void generatePulse() {
     }
   }
   
-  // G相の状態計算
+  // G相の状態計算（整数演算のみ）
   bool newGState = false;
   
-  // 現在の角度を計算（度）
-  float currentAngle = (float)pulseCount * 360.0 / (PULSES_PER_REV * 4);
+  // G相の周期内でのエッジ位置
+  int edgeInCycle = pulseCount % TOTAL_EDGES_PER_CYCLE;
   
-  // G相の周期内での角度
-  float angleInCycle = fmod(currentAngle, 360.0 * G_PHASE_ROTATIONS);
-  
-  // G相の開始と終了角度を計算
-  float gStartAngle = G_PHASE_START_DEG;
-  float gEndAngle = gStartAngle + (float)G_PHASE_EDGES * 360.0 / (PULSES_PER_REV * 4);
-  
-  // G相の出力判定
-  if (angleInCycle >= gStartAngle && angleInCycle < gEndAngle) {
+  // G相の出力判定（事前計算した定数使用）
+  if (edgeInCycle >= G_PHASE_START_EDGES && edgeInCycle < G_PHASE_END_EDGES) {
     newGState = true;
   }
   
@@ -103,11 +118,34 @@ void generatePulse() {
   zState = newZState;
   gState = newGState;
   
-  // 出力を更新
-  digitalWrite(A_PHASE_PIN, aState ? HIGH : LOW);
-  digitalWrite(B_PHASE_PIN, bState ? HIGH : LOW);
-  digitalWrite(Z_PHASE_PIN, zState ? HIGH : LOW);
-  digitalWrite(G_PHASE_PIN, gState ? HIGH : LOW);
+  // 出力を更新（高速化のためレジスタ直接操作）
+  // A相（D2 = PD2）
+  if (aState) {
+    PORTD |= (1 << PD2);
+  } else {
+    PORTD &= ~(1 << PD2);
+  }
+  
+  // B相（D8 = PB0）
+  if (bState) {
+    PORTB |= (1 << PB0);
+  } else {
+    PORTB &= ~(1 << PB0);
+  }
+  
+  // Z相（D9 = PB1）
+  if (zState) {
+    PORTB |= (1 << PB1);
+  } else {
+    PORTB &= ~(1 << PB1);
+  }
+  
+  // G相（D5 = PD5）
+  if (gState) {
+    PORTD |= (1 << PD5);
+  } else {
+    PORTD &= ~(1 << PD5);
+  }
 }
 
 void setup() {
@@ -123,13 +161,16 @@ void setup() {
   pinMode(KILL_IN_PIN, INPUT_PULLUP);  // キルスイッチ入力（プルアップ）
   pinMode(START_IN_PIN, INPUT_PULLUP); // スタータボタン入力（プルアップ）
     
-  // 初期状態
-  digitalWrite(A_PHASE_PIN, LOW);
-  digitalWrite(B_PHASE_PIN, LOW);
-  digitalWrite(Z_PHASE_PIN, LOW);
-  digitalWrite(G_PHASE_PIN, LOW);
-  digitalWrite(KILL_OUT_PIN, LOW);
-  digitalWrite(START_OUT_PIN, LOW);
+  // 初期状態（レジスタ直接操作）
+  // D2(A相), D5(G相) = LOW
+  PORTD &= ~((1 << PD2) | (1 << PD5));
+  // D8(B相), D9(Z相) = LOW
+  PORTB &= ~((1 << PB0) | (1 << PB1));
+  // D6(スタート出力), D7(キル出力) = LOW
+  PORTD &= ~((1 << PD6) | (1 << PD7));
+  
+  // 高速ADC初期化
+  setupHighSpeedADC();
   
   Serial.println("MA735 Encoder Simulator Started");
   Serial.println("PPT=359 (360 pulses/turn), ILIP=1111");
@@ -140,72 +181,217 @@ void setup() {
   Serial.print("°, ");
   Serial.print(G_PHASE_EDGES);
   Serial.println(" edges");
-  Serial.println("A0: Speed Control (0-6500 RPM)");
-  Serial.println("D2: A Phase, D3: B Phase, D4: Z Phase, D5: G Phase");
+  Serial.println("A7: Speed Control (0-6500 RPM) - High Speed ADC");
+  Serial.println("D2: A Phase, D8: B Phase, D9: Z Phase, D5: G Phase");
+  Serial.println("A4: Kill Switch Input, A5: Start Button Input");
+  Serial.println("D6: Start Button Output, D7: Kill Switch Output");
+  Serial.println("ADC: Free-running mode, 125KHz clock, interrupt-driven");
 }
 
 void loop() {
-  // SWの状態を確認
-  int KILL_SW_State = digitalRead(KILL_IN_PIN);
-  int START_SW_State = digitalRead(START_IN_PIN);
+  // SWの状態を確認（レジスタ直接読み取り）
+  // A4(KILL_IN) = PC4, A5(START_IN) = PC5
+  int KILL_SW_State = (PINC & (1 << PC4)) ? swOFF : swON;
+  int START_SW_State = (PINC & (1 << PC5)) ? swOFF : swON;
 
   // キルスイッチの状態に応じて出力を制御
   if (KILL_SW_State == swON) {  // キルスイッチがON
-    digitalWrite(KILL_OUT_PIN, LOW);
+    // D7(キル出力) = LOW
+    PORTD &= ~(1 << PD7);
 
     // スタータボタンの状態に応じて出力を制御
     if (START_SW_State == swON) {  // スタータボタンがON
-      digitalWrite(START_OUT_PIN, LOW);
+      // D6(スタート出力) = LOW
+      PORTD &= ~(1 << PD6);
       currentRPM = START_RPM; // 始動時回転数
     } else {                        // スタータボタンがOFF
-      digitalWrite(START_OUT_PIN, HIGH);
+      // D6(スタート出力) = HIGH
+      PORTD |= (1 << PD6);
     
-      // 可変抵抗から回転数を読み取り
-      int potValue = analogRead(POT_PIN);
-      currentRPM = map(potValue, 0, 1023, 0, MAX_RPM * 100) / 100.0;
+      // 高速ADC処理でRPM更新（割り込み完了時のみ）
+      if (adc0_read_complete) {
+        adc0_read_complete = false;
+        // 直接RPMに変換（ADC 0-1023 → RPM 0-6500）
+        currentRPM = (adc0 * MAX_RPM) / 1023;
+      }
     }
   } else {                      // キルスイッチがOFF
-    digitalWrite(KILL_OUT_PIN, HIGH);
+    // D7(キル出力) = HIGH
+    PORTD |= (1 << PD7);
 
     // パルス生成を停止
     currentRPM = 0; // 停止状態
   }
   
-  // パルス間隔を計算（マイクロ秒）
+  // パルス間隔を計算（マイクロ秒）整数演算
   if (currentRPM > 0) {
-    float pulsesPerSecond = (currentRPM / 60.0) * PULSES_PER_REV;
-    pulseInterval = 1000000.0 / pulsesPerSecond; // マイクロ秒
+    // pulsesPerSecond = (currentRPM / 60) * PULSES_PER_REV
+    // 整数演算：pulsesPerSecond = (currentRPM * PULSES_PER_REV) / 60
+    uint32_t pulsesPerSecond = (currentRPM * PULSES_PER_REV) / 60;
+    pulseInterval = 1000000UL / pulsesPerSecond; // マイクロ秒
+    
+    // 高速動作時（10kHz以上）はハードウェアタイマーを使用
+    if (pulsesPerSecond > 10000) {
+      if (!useHighPrecisionTimer) {
+        setupHighPrecisionTimer();
+        useHighPrecisionTimer = true;
+      }
+      setTimerFrequency(pulsesPerSecond);
+    } else {
+      if (useHighPrecisionTimer) {
+        // タイマーを無効化
+        TIMSK1 &= ~(1 << OCIE1A);
+        useHighPrecisionTimer = false;
+      }
+    }
   } else {
     pulseInterval = 0; // 停止
+    if (useHighPrecisionTimer) {
+      TIMSK1 &= ~(1 << OCIE1A);
+      useHighPrecisionTimer = false;
+    }
   }
 
-  // パルス生成
-  unsigned long currentMicros = micros();
-  if (pulseInterval > 0 && (currentMicros - lastMicros >= pulseInterval)) {
-    generatePulse();
-    lastMicros = currentMicros;
+  // パルス生成（タイマー使用時は割り込みで処理）
+  if (useHighPrecisionTimer) {
+    if (timerPulseFlag) {
+      generatePulse();
+      timerPulseFlag = false;
+    }
+  } else {
+    unsigned long currentMicros = micros();
+    if (pulseInterval > 0 && (currentMicros - lastMicros >= pulseInterval)) {
+      generatePulse();
+      lastMicros = currentMicros;
+    }
   }
   
   // デバッグ情報出力
   if (millis() - lastDebugTime >= DEBUG_INTERVAL) {
-    float currentAngle = (float)pulseCount * 360.0 / (PULSES_PER_REV * 4);
-    float angleInCycle = fmod(currentAngle, 360.0 * G_PHASE_ROTATIONS);
+    // 整数演算で角度計算
+    int currentAngle = (pulseCount * 360) / TOTAL_EDGES_PER_REV;
+    int angleInCycle = (pulseCount % TOTAL_EDGES_PER_CYCLE * 360) / TOTAL_EDGES_PER_REV;
     
     Serial.print("KILL SW: ");
     Serial.print(KILL_SW_State == swON ? "ON" : "OFF");
     Serial.print(", START SW: ");
     Serial.print(START_SW_State == swON ? "ON" : "OFF");
     Serial.print(", RPM: ");
-    Serial.print(currentRPM, 1);
+    Serial.print(currentRPM);
     Serial.print(", Angle: ");
-    Serial.print(angleInCycle, 1);
+    Serial.print(angleInCycle);
     Serial.print("°, Pulse: ");
     Serial.print(pulseCount);
     Serial.print("/");
-    Serial.print(PULSES_PER_REV * 4 * G_PHASE_ROTATIONS);
+    Serial.print(TOTAL_EDGES_PER_CYCLE);
     Serial.print(", G: ");
     Serial.print(gState ? "H" : "L");
+    Serial.print(", Timer: ");
+    Serial.print(useHighPrecisionTimer ? "HW" : "SW");
+    Serial.print(", ADC: ");
+    Serial.print(adc0);
+    Serial.print(" (std: ");
+    Serial.print(analogRead(POT_PIN));
+    Serial.print(")");
     Serial.println();
     lastDebugTime = millis();
+  }
+}
+
+// 高精度タイマー設定関数
+void setupHighPrecisionTimer() {
+  noInterrupts();
+  
+  // タイマーレジスタ初期化
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  
+  // CTCモード設定
+  TCCR1B |= (1 << WGM12);
+  
+  // 初期プリスケーラー設定（64）
+  TCCR1B |= (1 << CS11) | (1 << CS10);
+  
+  // 比較マッチ割り込み有効化
+  TIMSK1 |= (1 << OCIE1A);
+  
+  interrupts();
+}
+
+// タイマー周波数設定関数（整数演算版）
+void setTimerFrequency(uint32_t frequency) {
+  noInterrupts();
+  
+  // 16MHz基準クロック
+  uint32_t clockFreq = 16000000UL;
+  uint32_t targetCompare;
+  
+  // 最適なプリスケーラーを選択
+  if (frequency > 62500) {
+    // プリスケーラー 1
+    TCCR1B = (TCCR1B & 0xF8) | (1 << CS10);
+    targetCompare = clockFreq / frequency - 1;
+  } else if (frequency > 7812) {
+    // プリスケーラー 8
+    TCCR1B = (TCCR1B & 0xF8) | (1 << CS11);
+    targetCompare = clockFreq / (8 * frequency) - 1;
+  } else if (frequency > 976) {
+    // プリスケーラー 64
+    TCCR1B = (TCCR1B & 0xF8) | (1 << CS11) | (1 << CS10);
+    targetCompare = clockFreq / (64 * frequency) - 1;
+  } else if (frequency > 244) {
+    // プリスケーラー 256
+    TCCR1B = (TCCR1B & 0xF8) | (1 << CS12);
+    targetCompare = clockFreq / (256 * frequency) - 1;
+  } else {
+    // プリスケーラー 1024
+    TCCR1B = (TCCR1B & 0xF8) | (1 << CS12) | (1 << CS10);
+    targetCompare = clockFreq / (1024 * frequency) - 1;
+  }
+  
+  // 範囲チェック
+  if (targetCompare > 65535) targetCompare = 65535;
+  if (targetCompare < 1) targetCompare = 1;
+  
+  OCR1A = (uint16_t)targetCompare;
+  
+  interrupts();
+}
+
+// Timer1 比較マッチ割り込み
+ISR(TIMER1_COMPA_vect) {
+  timerPulseFlag = true;
+}
+
+// 高速ADC設定関数（修正版）
+void setupHighSpeedADC() {
+  // ADC設定レジスタの初期化
+  ADMUX = 0;                 // 全てクリア
+  ADMUX |= (1 << REFS0);     // AVCC基準電圧
+  ADMUX |= 7;                // A7ピン（アナログ7チャンネル）を選択
+  
+  ADCSRA = 0;                // 全てクリア
+  ADCSRA |= (1 << ADEN);     // ADC有効化
+  ADCSRA |= (1 << ADATE);    // オートトリガー有効
+  ADCSRA |= (1 << ADIE);     // ADC割り込み有効
+  ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // プリスケーラー128
+  
+  ADCSRB = 0;                // フリーランモード（ADTS=000）
+  
+  // 初期化完了フラグ
+  adc0_read_complete = false;
+  analog_port = 0;
+  
+  // ADC開始
+  ADCSRA |= (1 << ADSC);
+}
+
+// ADC割り込みサービスルーチン
+ISR(ADC_vect) {
+  if (analog_port == 0) {
+    adc0 = ADCL | (ADCH << 8);    // 10bit ADC値を直接読み取り
+    adc0_read_complete = true;     // 完了フラグ設定
+    return;
   }
 }

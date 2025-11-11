@@ -1,0 +1,3 @@
+[submodule "Ardu-Stim"]
+	path = Ardu-Stim
+	url = https://github.com/speeduino/Ardu-Stim.git
