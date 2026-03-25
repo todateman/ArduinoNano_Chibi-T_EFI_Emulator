@@ -7,7 +7,7 @@ const int swOFF = HIGH;  // SWがOFFのピンの値はHIGH
 // ピン定義
 const int KILL_IN_PIN = A4;    // キルスイッチ入力（内部プルアップ）
 const int START_IN_PIN  = A5;  // スタータボタン入力（内部プルアップ）
-const int POT_PIN = A7;        // 可変抵抗
+const int POT_PIN = A0;        // 可変抵抗
 const int A_PHASE_PIN = 2;     // A相出力
 const int B_PHASE_PIN = 8;     // B相出力
 const int Z_PHASE_PIN = 9;     // Z相出力
@@ -28,7 +28,7 @@ const int G_PHASE_EDGES = 720;      // G相出力エッジ数(4エッジ/1度))
 // 高速計算用定数
 const int TOTAL_EDGES_PER_REV = PULSES_PER_REV * 4;  // 1回転あたりの総エッジ数
 const int TOTAL_EDGES_PER_CYCLE = TOTAL_EDGES_PER_REV * G_PHASE_ROTATIONS; // G相周期の総エッジ数
-const int G_PHASE_START_EDGES = (G_PHASE_START_DEG * TOTAL_EDGES_PER_REV) / 360; // G相開始エッジ
+const int G_PHASE_START_EDGES = (int)((int32_t)G_PHASE_START_DEG * TOTAL_EDGES_PER_REV / 360); // G相開始エッジ
 const int G_PHASE_END_EDGES = G_PHASE_START_EDGES + G_PHASE_EDGES; // G相終了エッジ
 
 // 高速・高精度制御用タイマー変数
@@ -60,11 +60,36 @@ volatile bool gState = false;            // G相状態
 unsigned long lastDebugTime = 0;    // 最後のデバッグ出力時間
 const unsigned long DEBUG_INTERVAL = 1000; // 1秒間隔
 
+// シリアル制御モード
+bool serialControlMode = false;
+bool serialKillSW = false;    // シリアルモードでのKILL SW上書き（true=ON）
+bool serialStartSW = false;   // シリアルモードでのSTART SW上書き（true=ON）
+uint16_t serialRPM = 0;       // シリアルモードでのRPM
+
+// シリアル受信バッファ（非ブロッキング方式）
+char serialBuffer[32];
+uint8_t serialBufPos = 0;
+
+// SW前回状態（シリアルモード解除のエッジ検出用）
+int prevKillSWState = swOFF;
+int prevStartSWState = swOFF;
+
+// SWデバウンス用変数
+const unsigned long SW_DEBOUNCE_MS = 20;  // 20msデバウンス
+unsigned long killDebounceTimer = 0;
+unsigned long startDebounceTimer = 0;
+int rawKillSWState_prev  = swOFF;
+int rawStartSWState_prev = swOFF;
+int debouncedKillState  = swOFF;
+int debouncedStartState = swOFF;
+
 // プロトタイプ宣言
 void generatePulse();           // パルス生成関数
 void setupHighPrecisionTimer(); // 高精度タイマー設定
 void setTimerFrequency(uint32_t frequency); // タイマー周波数設定
 void setupHighSpeedADC();       // 高速ADC設定
+void checkSerialInput();        // シリアル入力チェック（非ブロッキング）
+void processSerialCommand(const char* cmd); // シリアルコマンド処理
 
 // パルス生成関数
 // この関数は、エンコーダのパルスを生成し、A相、B相、Z相、G相の状態を更新します。
@@ -107,10 +132,6 @@ void generatePulse() {
   if (edgeInCycle >= G_PHASE_START_EDGES && edgeInCycle < G_PHASE_END_EDGES) {
     newGState = true;
   }
-  
-  // エッジ検出のため前の状態を保存
-  bool prevAState = aState;
-  bool prevBState = bState;
   
   // 状態を更新
   aState = newAState;
@@ -181,25 +202,70 @@ void setup() {
   Serial.print("°, ");
   Serial.print(G_PHASE_EDGES);
   Serial.println(" edges");
-  Serial.println("A7: Speed Control (0-6500 RPM) - High Speed ADC");
+  Serial.println("A0: Speed Control (0-6500 RPM) - High Speed ADC");
   Serial.println("D2: A Phase, D8: B Phase, D9: Z Phase, D5: G Phase");
   Serial.println("A4: Kill Switch Input, A5: Start Button Input");
   Serial.println("D6: Start Button Output, D7: Kill Switch Output");
   Serial.println("ADC: Free-running mode, 125KHz clock, interrupt-driven");
+  Serial.println("--- Serial Commands ---");
+  Serial.println("KILL:ON/OFF  - Kill switch output");
+  Serial.println("START:ON/OFF - Start button output");
+  Serial.println("RPM:0-6500   - Set RPM");
+  Serial.println("STATUS       - Show current state");
+  Serial.println("RESET        - Exit serial control mode");
+  Serial.println("Serial mode is active until physical switch pressed or MCU reset");
 }
 
 void loop() {
-  // SWの状態を確認（レジスタ直接読み取り）
-  // A4(KILL_IN) = PC4, A5(START_IN) = PC5
-  int KILL_SW_State = (PINC & (1 << PC4)) ? swOFF : swON;
-  int START_SW_State = (PINC & (1 << PC5)) ? swOFF : swON;
+  // シリアル入力処理（非ブロッキング）
+  checkSerialInput();
 
-  // キルスイッチの状態に応じて出力を制御
+  // SWの状態を確認（デバウンス処理付き）
+  // A4(KILL_IN) = PC4, A5(START_IN) = PC5
+  int rawKill  = (PINC & (1 << PC4)) ? swOFF : swON;
+  int rawStart = (PINC & (1 << PC5)) ? swOFF : swON;
+  unsigned long nowMs = millis();
+
+  if (rawKill != rawKillSWState_prev) {
+    rawKillSWState_prev = rawKill;
+    killDebounceTimer = nowMs;
+  }
+  if (nowMs - killDebounceTimer >= SW_DEBOUNCE_MS) {
+    debouncedKillState = rawKill;
+  }
+  int KILL_SW_State = debouncedKillState;
+
+  if (rawStart != rawStartSWState_prev) {
+    rawStartSWState_prev = rawStart;
+    startDebounceTimer = nowMs;
+  }
+  if (nowMs - startDebounceTimer >= SW_DEBOUNCE_MS) {
+    debouncedStartState = rawStart;
+  }
+  int START_SW_State = debouncedStartState;
+
+  // 物理SWが新たに押された瞬間（OFF→ONのエッジ）でシリアルモードを解除
+  if (serialControlMode) {
+    if ((prevKillSWState == swOFF && KILL_SW_State == swON) ||
+        (prevStartSWState == swOFF && START_SW_State == swON)) {
+      serialControlMode = false;
+      Serial.println("[Serial mode exited by physical switch]");
+    }
+  }
+  prevKillSWState = KILL_SW_State;
+  prevStartSWState = START_SW_State;
+
+  if (serialControlMode) {
+    // シリアルモードの場合、SW入力を上書き
+    KILL_SW_State  = serialKillSW  ? swON : swOFF;
+    START_SW_State = serialStartSW ? swON : swOFF;
+  }
+
+  // SW状態に基づく出力制御（シリアル・物理共通ロジック）
   if (KILL_SW_State == swON) {  // キルスイッチがON
     // D7(キル出力) = LOW
     PORTD &= ~(1 << PD7);
 
-    // スタータボタンの状態に応じて出力を制御
     if (START_SW_State == swON) {  // スタータボタンがON
       // D6(スタート出力) = LOW
       PORTD &= ~(1 << PD6);
@@ -207,12 +273,12 @@ void loop() {
     } else {                        // スタータボタンがOFF
       // D6(スタート出力) = HIGH
       PORTD |= (1 << PD6);
-    
-      // 高速ADC処理でRPM更新（割り込み完了時のみ）
-      if (adc0_read_complete) {
+      if (serialControlMode) {
+        currentRPM = serialRPM;   // シリアル指定RPM
+      } else if (adc0_read_complete) {
         adc0_read_complete = false;
-        // 直接RPMに変換（ADC 0-1023 → RPM 0-6500）
-        currentRPM = (adc0 * MAX_RPM) / 1023;
+        // 直接RPMに変換（ADC 0-1023 → RPM 0-6500）uint32_tでオーバーフロー回避
+        currentRPM = (uint16_t)(((uint32_t)adc0 * MAX_RPM) / 1023);
       }
     }
   } else {                      // キルスイッチがOFF
@@ -269,7 +335,6 @@ void loop() {
   // デバッグ情報出力
   if (millis() - lastDebugTime >= DEBUG_INTERVAL) {
     // 整数演算で角度計算
-    int currentAngle = (pulseCount * 360) / TOTAL_EDGES_PER_REV;
     int angleInCycle = (pulseCount % TOTAL_EDGES_PER_CYCLE * 360) / TOTAL_EDGES_PER_REV;
     
     Serial.print("KILL SW: ");
@@ -286,13 +351,12 @@ void loop() {
     Serial.print(TOTAL_EDGES_PER_CYCLE);
     Serial.print(", G: ");
     Serial.print(gState ? "H" : "L");
+    Serial.print(", Mode: ");
+    Serial.print(serialControlMode ? "SER" : "PHY");
     Serial.print(", Timer: ");
     Serial.print(useHighPrecisionTimer ? "HW" : "SW");
     Serial.print(", ADC: ");
     Serial.print(adc0);
-    Serial.print(" (std: ");
-    Serial.print(analogRead(POT_PIN));
-    Serial.print(")");
     Serial.println();
     lastDebugTime = millis();
   }
@@ -369,7 +433,7 @@ void setupHighSpeedADC() {
   // ADC設定レジスタの初期化
   ADMUX = 0;                 // 全てクリア
   ADMUX |= (1 << REFS0);     // AVCC基準電圧
-  ADMUX |= 7;                // A7ピン（アナログ7チャンネル）を選択
+  ADMUX |= 0;                // A0ピン（アナログ0チャンネル）を選択
   
   ADCSRA = 0;                // 全てクリア
   ADCSRA |= (1 << ADEN);     // ADC有効化
@@ -378,6 +442,8 @@ void setupHighSpeedADC() {
   ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // プリスケーラー128
   
   ADCSRB = 0;                // フリーランモード（ADTS=000）
+  
+  DIDR0 |= (1 << ADC0D);    // A0のデジタル入力バッファ無効化（ADCノイズ低減）
   
   // 初期化完了フラグ
   adc0_read_complete = false;
@@ -390,8 +456,89 @@ void setupHighSpeedADC() {
 // ADC割り込みサービスルーチン
 ISR(ADC_vect) {
   if (analog_port == 0) {
-    adc0 = ADCL | (ADCH << 8);    // 10bit ADC値を直接読み取り
-    adc0_read_complete = true;     // 完了フラグ設定
+    uint8_t low  = ADCL;                        // ADCLを先に読む（ADCHがロックされる）
+    uint8_t high = ADCH;                        // 次にADCHを読む（ロック解除）
+    adc0 = ((uint16_t)high << 8) | low;         // 10bit ADC値
+    adc0_read_complete = true;                  // 完了フラグ設定
     return;
+  }
+}
+
+// シリアルコマンド処理
+// コマンド形式: KILL:ON/OFF, START:ON/OFF, RPM:0-6500, STATUS, RESET
+void processSerialCommand(const char* cmd) {
+  if (strncmp(cmd, "KILL:", 5) == 0) {
+    const char* val = cmd + 5;
+    if (strcmp(val, "ON") == 0) {
+      serialKillSW = true;
+    } else if (strcmp(val, "OFF") == 0) {
+      serialKillSW = false;
+    } else {
+      Serial.println("ERR: KILL:ON or KILL:OFF");
+      return;
+    }
+    serialControlMode = true;
+    Serial.print("OK KILL:");
+    Serial.println(serialKillSW ? "ON" : "OFF");
+  } else if (strncmp(cmd, "START:", 6) == 0) {
+    const char* val = cmd + 6;
+    if (strcmp(val, "ON") == 0) {
+      serialStartSW = true;
+    } else if (strcmp(val, "OFF") == 0) {
+      serialStartSW = false;
+    } else {
+      Serial.println("ERR: START:ON or START:OFF");
+      return;
+    }
+    serialControlMode = true;
+    Serial.print("OK START:");
+    Serial.println(serialStartSW ? "ON" : "OFF");
+  } else if (strncmp(cmd, "RPM:", 4) == 0) {
+    int rpm = atoi(cmd + 4);
+    if (rpm < 0 || rpm > MAX_RPM) {
+      Serial.print("ERR: RPM 0-");
+      Serial.println(MAX_RPM);
+      return;
+    }
+    serialRPM = (uint16_t)rpm;
+    serialKillSW  = true;   // RPMコマンドはKILL ON前提
+    serialStartSW = false;  // RPMコマンドはSTART OFF前提
+    serialControlMode = true;
+    Serial.print("OK RPM:");
+    Serial.println(serialRPM);
+  } else if (strcmp(cmd, "STATUS") == 0) {
+    Serial.print("Mode:");
+    Serial.println(serialControlMode ? "SERIAL" : "PHYSICAL");
+    Serial.print("RPM:");
+    Serial.println(currentRPM);
+    Serial.print("KILL_SW:");
+    Serial.println(serialKillSW ? "ON" : "OFF");
+    Serial.print("START_SW:");
+    Serial.println(serialStartSW ? "ON" : "OFF");
+  } else if (strcmp(cmd, "RESET") == 0) {
+    serialControlMode = false;
+    serialKillSW = false;
+    serialStartSW = false;
+    serialRPM = 0;
+    Serial.println("OK RESET");
+  } else {
+    Serial.print("ERR: Unknown cmd: ");
+    Serial.println(cmd);
+  }
+}
+
+// シリアル入力チェック（非ブロッキング・バッファ方式）
+void checkSerialInput() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBufPos > 0) {
+        serialBuffer[serialBufPos] = '\0';
+        processSerialCommand(serialBuffer);
+        serialBufPos = 0;
+      }
+    } else if (serialBufPos < 31) {
+      serialBuffer[serialBufPos++] = c;
+    }
   }
 }
