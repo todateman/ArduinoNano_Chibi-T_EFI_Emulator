@@ -1,3 +1,4 @@
 [submodule "Ardu-Stim"]
 	path = Ardu-Stim
-	url = https://github.com/speeduino/Ardu-Stim.git
+	url = https://github.com/todateman/Ardu-Stim.git
+	branch = develop/furoshiki
