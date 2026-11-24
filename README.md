@@ -2,85 +2,78 @@
 
 ## 概要
 
-MA735磁気式角度センサーのエンコーダ出力波形をArduino Nanoでシミュレートするプログラムです。  
-A7ピンに接続した可変抵抗で0〜6500rpmの回転数を制御し、リアルタイムでABZ + G相の信号を出力します。  
-また、A4, A5ピンでキルスイッチ、スタートボタンの入力を受け取り、D6, D7ピンでそれぞれ信号を出力します。
+MA735磁気式角度センサーのエンコーダ出力波形を Arduino Nano でシミュレートするプログラムです。  
+A0ピンに接続した可変抵抗で 0〜6500rpm の回転数を制御し、リアルタイムで **A / Z / G相** を出力します。  
+また、A4/A5ピンでキルスイッチ・スタートボタン入力を受け取り、D6/D5ピンでそれぞれアクティブLow出力します。  
+シリアルコマンドで外部から状態を上書きし、物理スイッチ押下（OFF→ONエッジ）で物理制御へ戻せます。
 
 ## 仕様
 
 ### ハードウェア要件
 
-- **マイコン**: Arduino Nano(Atmega328P)
+- **マイコン**: Arduino Nano (ATmega328P)
 - **入力**:
-  - A4: キルスイッチ(内部プルアップ)
-  - A5: スタートボタン(内部プルアップ)
-  - A7ピン 可変抵抗（0〜5V ADC入力）
+  - A4: キルスイッチ（内部プルアップ、GND接続でON）
+  - A5: スタートボタン（内部プルアップ、GND接続でON）
+  - A0: 可変抵抗（0〜5V ADC入力）
 - **出力**:
-  - D2: A相出力
-  - D5: G相出力
-  - D6: スタートボタン出力
-  - D7: キルスイッチ出力
-  - D8: B相出力  
+  - D5: スタートボタン出力（アクティブLow）
+  - D6: キルスイッチ出力（アクティブLow）
+  - D8: A相出力
   - D9: Z相出力（インデックス）
+  - D10: G相出力
+  - B相: **出力なし**（ECU側で常時GND接続）
 
 ### エンコーダ設定
 
 - **PPT（Pulses per Turn）**: 359（360パルス/回転）
-- **ILIP（Index Length/Position）**: 1111
 - **分解能**: 1440エッジ/回転（360パルス × 4）
 - **最大回転数**: 6500rpm
 - **始動時回転数**: 600rpm
 
-### G相特殊設定
+### G相設定
 
 - **出力周期**: 2回転に1パルス
 - **開始角度**: 450度（1.5回転目）
-- **パルス幅**: 720エッジ分(4エッジ/1度)
-- **設定変更**: 変数で動的に変更可能
+- **パルス幅**: 720エッジ
 
 ## プログラム構成
 
 ### 主要変数
 
 ```cpp
-// エンコーダ仕様（整数型で高速化）
-const int PULSES_PER_REV = 360;   // 1回転あたりのパルス数
-const int MAX_RPM = 6500;         // 最大回転数
-const int START_RPM = 600;        // 始動時の回転数
+const int PULSES_PER_REV = 360;
+const int MAX_RPM = 6500;
+const int START_RPM = 600;
 
-// G相設定（変更可能）
-const int G_PHASE_ROTATIONS = 2;      // G相の出力周期（回転数）
-const int G_PHASE_START_DEG = 450;    // G相開始角度（度）
-const int G_PHASE_EDGES = 720;        // G相出力エッジ数
+const int G_PHASE_ROTATIONS = 2;
+const int G_PHASE_START_DEG = 450;
+const int G_PHASE_EDGES = 720;
 
-// 高速計算用定数（浮動小数点演算を回避）
-const int TOTAL_EDGES_PER_REV = PULSES_PER_REV * 4;  // 1回転あたりの総エッジ数
-const int TOTAL_EDGES_PER_CYCLE = TOTAL_EDGES_PER_REV * G_PHASE_ROTATIONS; // G相周期の総エッジ数
-const int G_PHASE_START_EDGES = (G_PHASE_START_DEG * TOTAL_EDGES_PER_REV) / 360; // G相開始エッジ
-const int G_PHASE_END_EDGES = G_PHASE_START_EDGES + G_PHASE_EDGES; // G相終了エッジ
+const int TOTAL_EDGES_PER_REV = PULSES_PER_REV * 4;
+const int TOTAL_EDGES_PER_CYCLE = TOTAL_EDGES_PER_REV * G_PHASE_ROTATIONS;
+const int G_PHASE_START_EDGES = (int)((int32_t)G_PHASE_START_DEG * TOTAL_EDGES_PER_REV / 360);
+const int G_PHASE_END_EDGES = G_PHASE_START_EDGES + G_PHASE_EDGES;
 
-// 高速ADC処理用変数
-volatile uint16_t adc0 = 0;              // ADC0読み取り値
-volatile bool adc0_read_complete = false; // ADC完了フラグ
-volatile uint8_t analog_port = 0;        // 現在のADCポート
+volatile uint16_t adc0 = 0;
 
-// ADC・RPM変換定数（Ardu-Stim方式）
-#define TMP_RPM_SHIFT 4    // x16倍のビットシフト
-#define TMP_RPM_CAP 9000   // 最大RPM制限
+bool serialControlMode = false;
+bool serialKillSW = false;
+bool serialStartSW = false;
+uint16_t serialRPM = 0;
 ```
 
 ### ピン定義
 
 ```cpp
-const int POT_PIN = A7;        // 可変抵抗
-const int A_PHASE_PIN = 2;     // A相出力
-const int B_PHASE_PIN = 8;     // B相出力
-const int Z_PHASE_PIN = 9;     // Z相出力
-const int G_PHASE_PIN = 5;     // G相出力
-const int KILL_OUT_PIN  = 7;   // キルスイッチ出力
-const int START_OUT_PIN = 6;   // スタータボタン出力
-const int KILL_IN_PIN   = A4;  // キルスイッチ入力
-const int START_IN_PIN  = A5;  // スタータボタン入力
+const int POT_PIN       = A0;
+const int KILL_IN_PIN   = A4;
+const int START_IN_PIN  = A5;
+const int A_PHASE_PIN   = 8;
+const int Z_PHASE_PIN   = 9;
+const int G_PHASE_PIN   = 10;
+const int KILL_OUT_PIN  = 6;
+const int START_OUT_PIN = 5;
 ```
 
 ### 主要機能
@@ -88,63 +81,74 @@ const int START_IN_PIN  = A5;  // スタータボタン入力
 #### 1. setup()
 
 - シリアル通信初期化（115200bps）
-- ピン設定（出力モード）
-- 初期状態設定
-- 設定内容の表示
+- ピン設定
+- 起動メッセージとコマンドヘルプ表示
 
 #### 2. loop()
 
-- 入力状態読み取り
-- 入力状態で条件分岐
-  - キルスイッチがONの場合:
-    - スタートボタンがONの場合: 回転数を始動時回転数に設定
-    - スタートボタンがOFFの場合: 可変抵抗から回転数読み取り
-  - キルスイッチがOFFの場合: 回転数を0rpmに設定
-- パルス間隔計算
-- タイミング制御によるパルス生成
-- デバッグ情報出力（1秒間隔）
+- シリアル入力チェック（非ブロッキング）
+- SW状態読み取り（デバウンス20ms）
+- 物理SWのOFF→ONエッジでシリアルモード解除
+- シリアルモード時は `serialKillSW` / `serialStartSW` でSW状態上書き
+- 出力制御ロジック:
+  - KILL ON + START ON  → D6=LOW, D5=LOW, RPM=600
+  - KILL ON + START OFF → D6=LOW, D5=HIGH, RPMは可変抵抗またはシリアル値
+  - KILL OFF            → D6=HIGH, D5=HIGH, RPM=0
+- 10kHz超で Timer1 CTC へ自動切替
 
 #### 3. generatePulse()
 
-- パルスカウンター管理
-- A相/B相の90度位相差生成
-- Z相インデックス生成（ILIP=1111設定）
-- G相特殊パターン生成（整数演算のみ）
-- 出力ピン制御（レジスタ直接操作）
+- 4エッジで1パルス（360PPR）
+- A相生成（D8）
+- Z相生成（D9、1回転に1回）
+- G相生成（D10、2回転周期）
+- レジスタ直接操作で高速出力
 
-#### 4. setupHighSpeedADC()
+#### 4. checkSerialInput() / processSerialCommand()
 
-- ADCレジスタ直接制御
-- フリーランモード設定
-- 125KHz ADCクロック設定
-- 割り込み有効化
+- 32バイト固定長バッファ
+- 改行(`\n`/`\r`)でコマンド確定
+- `strcmp`/`strncmp`/`atoi`で軽量処理
+
+## シリアルコマンド
+
+| コマンド | 動作 |
+| ------- | ---- |
+| `KILL:ON` | KILL SW = ON として扱う（D6=LOW） |
+| `KILL:OFF` | KILL SW = OFF として扱う（D6=HIGH、RPM=0） |
+| `START:ON` | START SW = ON として扱う（D5=LOW、RPM=600） |
+| `START:OFF` | START SW = OFF として扱う（D5=HIGH） |
+| `RPM:0-6500` | KILL=ON・START=OFFを自動設定し指定RPMで動作 |
+| `STATUS` | 現在の状態を表示 |
+| `RESET` | シリアル制御モードを解除し物理SW制御に戻る |
+
+### シリアル制御モード
+
+- いずれかのコマンド受信で **SERモード** に移行
+- 以下で **PHYモード** に戻る:
+  - A4（KILL）押下のOFF→ONエッジ
+  - A5（START）押下のOFF→ONエッジ
+  - `RESET`コマンド
+  - MCUリセット
 
 ## 動作原理
 
-### ABZ信号生成
+### A/Z/G信号生成
 
-1. **A相**: 基本方形波（360パルス/回転）
-2. **B相**: A相より90度遅れた方形波
-3. **Z相**: 1回転に1回、A相とB相が両方HIGHの期間に出力（ILIP=1111）
-
-### G相信号生成
-
-1. **周期計算**: 2回転分（2880エッジ）でカウンターリセット
-2. **エッジ位置計算**: 整数演算のみで現在のエッジ位置を算出
-3. **出力判定**: 事前計算された開始・終了エッジ値を使用してHIGH出力
+1. **A相**: 360パルス/回転（D8）
+2. **Z相**: 1回転に1回のインデックス（D9）
+3. **G相**: 2回転周期のゲート信号（D10）
 
 ### タイミング制御
 
-- マイクロ秒精度のタイミング制御
-- RPMに応じたパルス間隔の動的計算（整数演算）
-- 高速ADC処理による可変抵抗値の読み取り
-- 10kHz以上での自動ハードウェアタイマー切り替え
+- 低周波域: `micros()` ベース
+- 高周波域: Timer1 CTC割り込み
+- RPMに応じたプリスケーラー自動選択（1/8/64/256/1024）
 
-### 高速ADC処理
+### A0（可変抵抗）読み取り
 
-1. **フリーランモード**: 連続サンプリングで高速化
-2. **割り込み駆動**: メインループをブロックしない非同期処理
-3. **ビットシフト変換**: 浮動小数点演算を回避した高速RPM変換
+- `analogRead(A0)` で取得
+- RPM変換: `(uint32_t)adc0 * MAX_RPM / 1023`
 
 ## 使用方法
 
@@ -152,264 +156,99 @@ const int START_IN_PIN  = A5;  // スタータボタン入力
 
 ```
 Arduino Nano
-├── A4 ← キルスイッチ入力（内部プルアップ）
-├── A5 ← スタータボタン入力（内部プルアップ）
-├── A7 ← 可変抵抗（中点）
-├── D2 → A相出力
-├── D8 → B相出力
-├── D9 → Z相出力
-└── D5 → G相出力
+├── A4  ← キルスイッチ（GND間、内部プルアップ）
+├── A5  ← スタートボタン（GND間、内部プルアップ）
+├── A0  ← 可変抵抗（中点）
+├── D5  → スタートボタン出力（アクティブLow）
+├── D6  → キルスイッチ出力（アクティブLow）
+├── D8  → A相出力
+├── D9  → Z相出力
+├── D10 → G相出力
+└── B相はECU側でGNDへ固定接続
 
 可変抵抗: 10kΩ推奨
-接続: VCC - 可変抵抗 - GND
-      A7 ← 可変抵抗中点
+接続: VCC ─ 可変抵抗 ─ GND、中点(ワイパー) → A0
 ```
 
-### 2. プログラム書き込み
+### 2. 書き込み
 
-1. Arduino IDEでスケッチをArduino Nanoに書き込み
+1. VSCode + PlatformIOでビルド・書き込み
 2. シリアルモニタを115200bpsで開く
-3. 初期化メッセージと設定確認
+3. 起動メッセージとコマンドヘルプを確認
 
-### 3. 動作確認
+### 3. 物理操作
 
-1. 可変抵抗を回して回転数を変更
-2. オシロスコープでD2,D8,D9,D5の波形を観測
-3. シリアルモニタでデバッグ情報を確認
+1. A4（KILL）をGNDへ接続してON
+2. A0可変抵抗で回転数を変更（0〜6500rpm）
+3. A5（START）ONでRPM=600固定
+
+### 4. シリアル操作
+
+```
+RPM:3000
+KILL:OFF
+START:ON
+RESET
+```
 
 ## デバッグ出力
 
-シリアルモニタに1秒間隔で以下の情報を表示：
+1秒間隔で以下形式を出力:
 
 ```
-RPM: 1500.0, Angle: 234.5°, Pulse: 1250/2880, G: L
+KILL SW: ON, START SW: OFF, RPM: 3000, Angle: 254, Pulse: 1019/2880, G: L, Mode: SER, Timer: HW, ADC: 582
 ```
 
-- **RPM**: 現在の回転数
-- **Angle**: G相周期内での現在角度
-- **Pulse**: 現在のパルスカウント/総パルス数
-- **G**: G相の現在状態（H/L）
-
-## カスタマイズ
-
-### G相設定の変更
-
-```cpp
-// 例：3回転周期、720度開始、8エッジ幅に変更
-const int G_PHASE_ROTATIONS = 3;
-const int G_PHASE_START_DEG = 720;
-const int G_PHASE_EDGES = 8;
-```
-
-### PPT設定の変更
-
-```cpp
-// 例：1024パルス/回転に変更
-const int PULSES_PER_REV = 1024;
-```
+| フィールド | 説明 |
+| --------- | ---- |
+| `KILL SW` | キルスイッチ実効状態 |
+| `START SW` | スタートボタン実効状態 |
+| `RPM` | 現在回転数 |
+| `Angle` | G相周期内の角度相当値 |
+| `Pulse` | 現在エッジカウント / 周期総エッジ |
+| `G` | G相状態（H/L） |
+| `Mode` | `PHY`=物理制御、`SER`=シリアル制御 |
+| `Timer` | `SW`=ソフトウェア、`HW`=Timer1 CTC |
+| `ADC` | A0のADC生値（0〜1023） |
 
 ## 技術仕様
 
-### タイミング精度
+### タイミング
 
-- **基準クロック**: Arduino 16MHz
-- **最小パルス間隔**: 12.8μs（6500rpmのA/B相パルス）
-- **最大回転数**: 6500rpm対応
-- **ADC変換時間**: 約104μs（125KHzクロック）
+- 基準クロック: 16MHz
+- 最大回転数: 6500rpm
+- 10kHz超でハードウェアタイマーへ切替
 
 ### 信号仕様
 
-- **出力レベル**: 0V/5V（TTLレベル）
-- **立ち上がり/立ち下がり時間**: <1μs（レジスタ直接操作）
-- **位相精度**: ±1エッジ以内
+- 出力レベル: 0V/5V（TTL）
+- SW入力デバウンス: 20ms
 
-### 処理性能
+### 実装上の最適化
 
-- **計算方式**: 整数演算のみ（浮動小数点演算なし）
-- **IO処理**: レジスタ直接操作（digitalWrite比約10倍高速）
-- **ADC処理**: 割り込み駆動フリーランモード
-- **メモリ効率**: volatile変数の適切な使用
-
-### ハードウェアタイマーCTCモードの活用（`.\Ardu-Stim\ardustim\ardustim`を参照）
-
-**核心技術：**
-
-- Timer 1と2をCTC (Clear Timer on Compare) モードで使用
-- CTCタイマー割り込みは、カウンターが指定された値（比較マッチレジスタに格納）に達したときにトリガーされ、次のタイマークロックティックでクリア（ゼロにリセット）される
-
-**計算式：**
-
-```
-割り込み周波数 (Hz) = 16,000,000Hz / (プリスケーラー × (比較マッチレジスタ + 1))
-比較マッチレジスタ = [16,000,000Hz / (プリスケーラー × 希望周波数)] - 1
-```
-
-**基本セットアップ（例）：**
-
-```cpp
-// Timer1 CTC モード設定例
-void setupHighPrecisionTimer() {
-    noInterrupts();  // 割り込み無効化
-    
-    // タイマーレジスタ初期化
-    TCCR1A = 0;
-    TCCR1B = 0;
-    TCNT1 = 0;
-    
-    // 比較マッチレジスタ設定（例：1kHz）
-    OCR1A = 15624;  // 16MHz/1024/1Hz
-    
-    // CTCモード設定
-    TCCR1B |= (1 << WGM12);
-    
-    // プリスケーラー設定（1024）
-    TCCR1B |= (1 << CS12) | (1 << CS10);
-    
-    // 比較マッチ割り込み有効化
-    TIMSK1 |= (1 << OCIE1A);
-    
-    interrupts();  // 割り込み有効化
-}
-
-ISR(TIMER1_COMPA_vect) {
-    // 高精度タイミングで実行される処理
-}
-```
-
-### プリスケーラー選択の最適化（`.\Ardu-Stim\ardustim\ardustim`を参照）
-
-**選択指針：**
-
-- より大きなプリスケーラー値は、出力周波数が低くなり、消費電力がc v²f に比例するため、わずかに消費電力が減少する
-- 低いプリスケーラーはターゲットに近づけるが、CTCが0に近い場合（1-10）は、タイマーが異常動作することがある
-
-**推奨設定：**
-
-| 目標周波数 | 推奨プリスケーラー | 推奨OCR値範囲 |
-|------------|-------------------|---------------|
-| 1Hz - 100Hz | 1024 | 150-15000 |
-| 100Hz - 1kHz | 256 | 60-600 |
-| 1kHz - 10kHz | 64 | 25-250 |
-| 10kHz+ | 8-64 | 20-200 |
-
-### 複数信号同期出力の実装（`.\Ardu-Stim\ardustim\ardustim`を参照）
-
-**同期信号生成のコツ（例）：**
-
-```cpp
-volatile bool signal1_state = false;
-volatile bool signal2_state = false;
-volatile uint16_t signal_counter = 0;
-
-ISR(TIMER1_COMPA_vect) {
-    signal_counter++;
-    
-    // 信号1: 基本周波数
-    if (signal_counter % 2 == 0) {
-        signal1_state = !signal1_state;
-        digitalWrite(8, signal1_state);
-    }
-    
-    // 信号2: 1/4周波数
-    if (signal_counter % 8 == 0) {
-        signal2_state = !signal2_state;
-        digitalWrite(9, signal2_state);
-    }
-}
-```
-
-### 高速動作のための最適化テクニック（`.\Ardu-Stim\ardustim\ardustim`を参照）
-
-**レジスタ直接操作（実装済み）：**
-
-```cpp
-// digitalWrite()の代わりにレジスタ直接操作
-// A相（D2 = PD2）の場合
-if (aState) {
-  PORTD |= (1 << PD2);   // HIGH
-} else {
-  PORTD &= ~(1 << PD2);  // LOW
-}
-
-// 入力読み取り（A4 = PC4）
-int KILL_SW_State = (PINC & (1 << PC4)) ? swOFF : swON;
-```
-
-**整数演算による高速化（実装済み）：**
-
-```cpp
-// 浮動小数点演算を回避
-uint32_t pulsesPerSecond = (currentRPM * PULSES_PER_REV) / 60;
-tmp_rpm = adc0 << TMP_RPM_SHIFT;  // ビットシフト演算
-currentRPM = (tmp_rpm * MAX_RPM) / 16368;  // 整数除算
-```
-
-**高速ADC処理（実装済み）：**
-
-```cpp
-// フリーランモード設定
-ADCSRA |= B00100000;       // ADATE=1（オートトリガー有効）
-ADCSRB &= B11111000;       // ADTS2:0=000（フリーランモード）
-ADCSRA |= B00000111;       // プリスケーラー128（125KHz）
-```
-
-**メモリ効率化（実装済み）：**
-
-- volatileキーワードの適切な使用
-- 事前計算された定数の使用
-- 整数型変数の使用
-
-**タイマー競合の回避：**
-
-- delay()、millis()、analogWrite()との競合を避ける
-- 使用するタイマーを明確に管理する
-
-**割り込み処理の原則：**
-
-- ISRは可能な限り短く保つ
-- 複雑な処理は主ループで実行
-- volatile変数の適切な使用
-
-**デバッグ時の注意：**
-
-- Serial.print()をISR内で使用しない
-- LEDやピンの状態確認でデバッグ
+- 浮動小数点演算なし（整数演算）
+- レジスタ直接操作で高速IO
+- 定数を事前計算（G相開始/終了エッジ）
 
 ## MA735との対応
 
-| 項目 | MA735設定 | シミュレータ設定 |
-|------|-----------|------------------|
-| PPT | 359 | PULSES_PER_REV = 360 |
-| ILIP | 1111 | A&B両方HIGH時にZ出力 |
-| 分解能 | 1440エッジ/回転 | 360×4エッジ |
+| 項目 | シミュレータ設定 |
+| ---- | --------------- |
+| PPT | 359相当（360パルス/回転） |
+| 分解能 | 1440エッジ/回転 |
+| 出力相 | A/Z/G（B相は未出力） |
 
 ## 注意事項
 
-1. **電源電圧**: Arduino Nanoの5V動作を前提
-2. **負荷容量**: 出力ピンの駆動能力（最大40mA）を考慮
-3. **タイミング精度**: 他の割り込み処理による影響を最小化
-4. **シリアル通信**: デバッグ出力が不要な場合はコメントアウト推奨
-5. **メモリ使用量**: 整数演算とレジスタ直接操作により大幅削減
-6. **処理速度**: 浮動小数点演算を完全に排除し高速化を実現
-
-## 拡張機能
-
-### 将来の改良案
-
-- [x] Ardu-Stimの高速・高精度信号制御・出力処理を導入（完了）
-- [x] 浮動小数点演算の完全排除による高速化（完了）
-- [x] レジスタ直接操作によるIO高速化（完了）
-- [x] フリーランモードADC処理の実装（完了）
-- [ ] SPI通信でのリアルタイム設定変更
-- [ ] PWM出力の追加実装
-- [ ] エラー検出機能
-- [ ] 温度補償機能
-- [ ] EEPROM設定保存機能
+1. Arduino Nanoの5V動作を前提
+2. 可変抵抗はVCC-GND間に接続し、中点をA0へ接続
+3. `Serial.print()` の過多は高RPM時のタイミングに影響する場合あり
+4. `delay()` や `tone()` などTimer使用機能との競合に注意
 
 ---
 
 **作成日**: 2025年7月15日  
-**バージョン**: 2.0  
+**バージョン**: 3.1  
 **対象マイコン**: Arduino Nano (ATmega328P)  
 **開発環境**: VSCode & PlatformIO  
-**最終更新**: 2025年7月15日（高速化実装完了）
+**最終更新**: 2026年3月30日（現行実装へ整合）
